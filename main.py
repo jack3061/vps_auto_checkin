@@ -10,7 +10,7 @@ import requests
 
 
 # =========================
-# Env
+# Env (保持不改变量名)
 # =========================
 URL = (os.environ.get("URL") or "").strip().rstrip("/")
 CONFIG = os.environ.get("CONFIG") or ""
@@ -28,11 +28,6 @@ try:
     TIMEOUT = int((os.environ.get("TIMEOUT") or "20").strip())
 except Exception:
     TIMEOUT = 20
-
-# GitHub Actions env (optional)
-GITHUB_SERVER_URL = (os.environ.get("GITHUB_SERVER_URL") or "").strip()
-GITHUB_REPOSITORY = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
-GITHUB_RUN_ID = (os.environ.get("GITHUB_RUN_ID") or "").strip()
 
 
 # =========================
@@ -70,20 +65,18 @@ def parse_json_maybe(text: str):
 
 def is_already_checked_in(msg: str) -> bool:
     """
-    你要求：已经签到过也算成功，只备注原因
-    这里做一个偏宽松的识别，避免被当成失败
+    “已签到过”也算成功（只备注）
     """
     m = (msg or "").strip()
     if not m:
         return False
-    # 常见提示：已经签到 / 今日已签到 / 您似乎已经签到过了 / 已领取 等
     keywords = ["已经", "已", "签到过", "今日", "今天", "似乎已经", "重复", "领取过"]
     return ("签到" in m or "check" in m.lower()) and any(k in m for k in keywords)
 
 
 def parse_accounts(config_text: str) -> List[Tuple[str, str]]:
     """
-    支持两种格式：
+    兼容两种格式（但最终只取第一个账号）：
     1) 推荐：每行一个账号：email,password
     2) 兼容：两行一组：email 换行 password
     支持空行 & # 注释
@@ -99,7 +92,7 @@ def parse_accounts(config_text: str) -> List[Tuple[str, str]]:
     if not lines:
         raise ValueError("CONFIG 为空：请填写账号密码配置")
 
-    # 如果任意行包含逗号 -> 视为每行 email,password
+    # 逗号格式：每行 email,password
     if any("," in ln for ln in lines):
         accounts: List[Tuple[str, str]] = []
         for ln in lines:
@@ -113,7 +106,7 @@ def parse_accounts(config_text: str) -> List[Tuple[str, str]]:
             accounts.append((email, pwd))
         return accounts
 
-    # 否则两行一组
+    # 两行一组
     if len(lines) % 2 != 0:
         raise ValueError("CONFIG 两行一组格式错误：行数必须为偶数（邮箱/密码交替）")
 
@@ -127,8 +120,15 @@ def parse_accounts(config_text: str) -> List[Tuple[str, str]]:
     return accounts
 
 
+def pick_first_account(config_text: str) -> Tuple[str, str]:
+    accounts = parse_accounts(config_text)
+    return accounts[0]  # ✅ 单账号：只取第一个
+
+
 def tg_send_html(text_html: str) -> None:
-    """Telegram HTML 发送（自动重试；未配置 token/chat_id 则静默跳过）"""
+    """
+    Telegram HTML 发送（重试；未配置 token/chat_id 则静默跳过）
+    """
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
 
@@ -155,35 +155,6 @@ def tg_send_html(text_html: str) -> None:
         print(f"[TG] send failed: {last_err}")
 
 
-def tg_send_html_chunked(full_html: str) -> None:
-    """
-    Telegram 单条消息限制 4096 字符，这里做分段发送（尽量按空行分）
-    """
-    max_len = 3800  # 留点余量
-    if len(full_html) <= max_len:
-        tg_send_html(full_html)
-        return
-
-    parts = full_html.split("\n\n")
-    buf = ""
-    for p in parts:
-        candidate = (buf + "\n\n" + p) if buf else p
-        if len(candidate) <= max_len:
-            buf = candidate
-        else:
-            if buf:
-                tg_send_html(buf)
-            # 单段过长就硬切
-            if len(p) > max_len:
-                for i in range(0, len(p), max_len):
-                    tg_send_html(p[i:i + max_len])
-                buf = ""
-            else:
-                buf = p
-    if buf:
-        tg_send_html(buf)
-
-
 # =========================
 # Core
 # =========================
@@ -194,7 +165,7 @@ class CheckinResult:
     checkin_ok: bool
     checkin_executed: bool
     already_checked: bool
-    reason: str  # msg / error text
+    reason: str
 
 
 def sign_one(email: str, password: str) -> CheckinResult:
@@ -227,15 +198,13 @@ def sign_one(email: str, password: str) -> CheckinResult:
         j2 = parse_json_maybe(res2.text.strip())
 
         if not isinstance(j2, dict):
-            # 非 JSON，按失败处理
             return CheckinResult(masked, True, False, True, False, res2.text.strip()[:300])
 
-        # ret==1 -> 成功
         if j2.get("ret") in (1, "1", True):
             msg_ok = (j2.get("msg") or "").strip()
             return CheckinResult(masked, True, True, True, False, msg_ok)
 
-        # ret!=1 -> 失败，但如果是“已签到过” => 当作成功（备注原因）
+        # ret!=1：失败；但“已签到过”=> 算成功（备注原因）
         msg2 = (j2.get("msg") or "").strip()
         already = is_already_checked_in(msg2)
         if already:
@@ -247,94 +216,66 @@ def sign_one(email: str, password: str) -> CheckinResult:
         return CheckinResult(masked, False, False, False, False, repr(ex))
 
 
-def format_card_html(r: CheckinResult) -> str:
-    # “已签到过”在 r.checkin_ok=True 的前提下仍算成功（绿色卡片）
-    overall_ok = r.login_ok and r.checkin_ok
+def format_notify_html(r: CheckinResult) -> str:
+    # 标题样式：📊 + 横线（参考你给的截图）
+    title = f"📊 <b>{html_escape(NOTIFY_TITLE)}</b>"
+    line = "────────────────────"
 
-    head_icon = "🟩" if overall_ok else "🟥"
     lines = [
-        f'{head_icon} <b></b>',
-        "────────────",
-        f'👤 <b>账号</b>：{html_escape(r.email_masked)}',
-        f'🔐 <b>登录</b>：{"✅ 成功" if r.login_ok else "❌ 失败"}',
+        title,
+        line,
+        f"👤 <b>账号</b>：{html_escape(r.email_masked)}",
     ]
 
+    # 登录
+    lines.append(f"🔐 <b>登录</b>：{'✅ 成功' if r.login_ok else '❌ 失败'}")
+
+    # 登录失败：签到未执行
     if not r.login_ok:
-        lines.append('📝 <b>签到</b>：⏸ 未执行')
+        lines.append("📝 <b>签到</b>：⏸ 未执行")
         if r.reason:
-            lines.append(f'📌 <b>原因</b>：{html_escape(r.reason)}')
-        lines.append(f'🕒 <b>签到时间</b>：{html_escape(now_cn_str())}')
+            lines.append(f"📌 <b>原因</b>：{html_escape(r.reason)}")
+        lines.append(f"🕒 <b>签到时间</b>：{html_escape(now_cn_str())}")
         return "\n".join(lines)
 
-    # 登录成功
+    # 登录成功：签到
     if r.checkin_ok:
-        if r.already_checked:
-            lines.append('📝 <b>签到</b>：✅ 成功（已签到过）')
-            if r.reason:
-                lines.append(f'🗒️ <b>备注</b>：{html_escape(r.reason)}')
-        else:
-            lines.append('📝 <b>签到</b>：✅ 成功')
-            # 成功一般不需要原因，但如果接口 msg 有值也可以不显示；这里保持不显示
+        lines.append("📝 <b>签到</b>：✅ 成功")
+        if r.already_checked and r.reason:
+            lines.append(f"🗒️ <b>备注</b>：{html_escape(r.reason)}")
     else:
-        lines.append('📝 <b>签到</b>：❌ 失败')
+        lines.append("📝 <b>签到</b>：❌ 失败")
         if r.reason:
-            lines.append(f'📌 <b>原因</b>：{html_escape(r.reason)}')
+            lines.append(f"📌 <b>原因</b>：{html_escape(r.reason)}")
 
-    lines.append(f'🕒 <b>签到时间</b>：{html_escape(now_cn_str())}')
+    lines.append(f"🕒 <b>签到时间</b>：{html_escape(now_cn_str())}")
     return "\n".join(lines)
 
 
-def format_summary_html(results: List[CheckinResult]) -> str:
-    hard_fail = [x for x in results if (not x.login_ok) or (x.login_ok and x.checkin_executed and not x.checkin_ok)]
-    ok_count = len(results) - len(hard_fail)
-    total = len(results)
-
-    overall_ok = len(hard_fail) == 0
-    head_icon = "🟩" if overall_ok else "🟥"
-    status = "全部成功" if overall_ok else f"失败 {len(hard_fail)}/{total}"
-
-    # Actions run link (if available)
-    link = ""
-    if GITHUB_SERVER_URL and GITHUB_REPOSITORY and GITHUB_RUN_ID:
-        url = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}/actions/runs/{GITHUB_RUN_ID}"
-        link = f'\n🔗 <a href="{html_escape(url)}">查看运行详情</a>'
-
-    return f'{head_icon} <b></b>\n✅ 成功：{ok_count}/{total}  ·  {"✅ " + status if overall_ok else "❌ " + status}{link}'
-
-
 def main():
-    accounts = parse_accounts(CONFIG)
-    results: List[CheckinResult] = []
+    email, pwd = pick_first_account(CONFIG)
+    result = sign_one(email, pwd)
 
-    for email, pwd in accounts:
-        r = sign_one(email, pwd)
-        results.append(r)
+    # Actions 日志里打印一行（便于看）
+    print(
+        f"[{result.email_masked}] "
+        f"login={'OK' if result.login_ok else 'FAIL'} "
+        f"checkin={'OK' if result.checkin_ok else 'FAIL'} "
+        f"{'(already)' if result.already_checked else ''} "
+        f"reason={result.reason[:120] if result.reason else ''}"
+    )
 
-        # Actions 日志里打印简洁版（不带HTML标签）
-        print(f"[{r.email_masked}] login={'OK' if r.login_ok else 'FAIL'} "
-              f"checkin={'OK' if r.checkin_ok else 'FAIL'} "
-              f"{'(already)' if r.already_checked else ''} "
-              f"reason={r.reason[:120] if r.reason else ''}")
+    text_html = format_notify_html(result)
 
-    # hard fail：登录失败 或 “真正签到失败(非已签到过)”
-    hard_fail = [x for x in results if (not x.login_ok) or (x.login_ok and x.checkin_executed and not x.checkin_ok)]
-    all_ok = len(hard_fail) == 0
-
-    # 失败：一定通知
-    if not all_ok:
-        blocks = [format_summary_html(results)]
-        blocks.extend(format_card_html(x) for x in hard_fail)
-        tg_send_html_chunked("\n\n".join(blocks))
+    # 失败：一定通知 + exit 1
+    # 成功：默认静默；开关打开才通知
+    hard_fail = (not result.login_ok) or (result.login_ok and result.checkin_executed and not result.checkin_ok)
+    if hard_fail:
+        tg_send_html(text_html)
         raise SystemExit(1)
 
-    # 全成功：默认静默；开关打开才通知
     if NOTIFY_ON_SUCCESS:
-        blocks = [format_summary_html(results)]
-        blocks.extend(format_card_html(x) for x in results)
-        tg_send_html_chunked("\n\n".join(blocks))
-
-    # all ok -> exit 0
-    return
+        tg_send_html(text_html)
 
 
 if __name__ == "__main__":
