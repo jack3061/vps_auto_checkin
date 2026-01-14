@@ -2,28 +2,20 @@ name: "Common airport Checkin"
 
 on:
   schedule:
-    - cron: "0 14 * * *"  # scheduled at 06:00 (UTC+8) everyday
+    - cron: "0 14 * * *"   # 06:00 (UTC+8) everyday
   workflow_dispatch:
 
-env:
-  RUN_ENV: 'prod'
-
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
-    # if: github.ref == 'refs/heads/master'
-
     steps:
-      - name: Checkout master
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-          # ref: master
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up python
         uses: actions/setup-python@v5
         with:
-          python-version: 3.10.16
+          python-version: "3.10"
 
       - name: Random sleep
         if: github.event_name == 'schedule'
@@ -33,12 +25,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Run sign
+
+      - name: Run checkin
         env:
           URL: ${{ secrets.URL }}
-          SCKEY: ${{ secrets.SCKEY }}
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWD: ${{ secrets.PASSWD }}
           CONFIG: ${{ secrets.CONFIG }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NOTIFY_ON_SUCCESS: ${{ secrets.NOTIFY_ON_SUCCESS }}
+          # 可选：
+          # TIMEOUT: "20"
+          # DEBUG: "false"
         run: |
           python3 ./main.py
